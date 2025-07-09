@@ -1,0 +1,197 @@
+name: Microservices CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  JAVA_VERSION: '11'
+  NODE_VERSION: '16'
+
+jobs:
+  test-services:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [user-service, product-service, order-service, notification-service]
+    
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      mongodb:
+        image: mongo:5.0
+        env:
+          MONGO_INITDB_ROOT_USERNAME: test
+          MONGO_INITDB_ROOT_PASSWORD: test
+        ports:
+          - 27017:27017
+
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: testdb
+          MYSQL_USER: test
+          MYSQL_PASSWORD: test
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+        ports:
+          - 3306:3306
+
+      redis:
+        image: redis:6-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up JDK ${{ env.JAVA_VERSION }}
+      uses: actions/setup-java@v3
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: 'temurin'
+
+    - name: Cache Maven dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+
+    - name: Test ${{ matrix.service }}
+      run: |
+        cd ${{ matrix.service }}
+        ./mvnw clean test
+        
+    - name: Generate test report for ${{ matrix.service }}
+      uses: dorny/test-reporter@v1
+      if: success() || failure()
+      with:
+        name: ${{ matrix.service }} Tests
+        path: ${{ matrix.service }}/target/surefire-reports/*.xml
+        reporter: java-junit
+
+  test-frontend:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Set up Node.js ${{ env.NODE_VERSION }}
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+        
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm ci
+        
+    - name: Run frontend tests
+      run: |
+        cd frontend
+        npm test -- --coverage --watchAll=false
+
+  integration-tests:
+    needs: [test-services, test-frontend]
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Set up JDK ${{ env.JAVA_VERSION }}
+      uses: actions/setup-java@v3
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: 'temurin'
+        
+    - name: Start infrastructure with Docker Compose
+      run: |
+        docker-compose -f docker-compose.test.yml up -d
+        sleep 60  # Wait for services to be ready
+        
+    - name: Run integration tests
+      run: |
+        ./scripts/run-integration-tests.sh
+        
+    - name: Cleanup
+      if: always()
+      run: |
+        docker-compose -f docker-compose.test.yml down
+
+  build-and-push:
+    needs: [test-services, test-frontend, integration-tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Build Docker images
+      run: |
+        docker build -t microservices/user-service ./user-service
+        docker build -t microservices/product-service ./product-service
+        docker build -t microservices/order-service ./order-service
+        docker build -t microservices/notification-service ./notification-service
+        docker build -t microservices/api-gateway ./api-gateway
+        docker build -t microservices/frontend ./frontend
+        
+    - name: Run security scan
+      run: |
+        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          -v $(pwd):/app clair-scanner microservices/user-service
+
+  deploy-to-staging: deploy-to-staging:
+   needs: [build-and-push]
+   runs-on: ubuntu-latest
+   if: github.ref == 'refs/heads/main'
+   
+   steps:
+   - name: Checkout code
+     uses: actions/checkout@v3
+     
+   - name: Deploy to staging
+     run: |
+       echo "Deploying to staging environment..."
+       # Add your deployment commands here
+       # kubectl apply -f k8s/staging/
+       
+   - name: Run smoke tests
+     run: |
+       ./scripts/smoke-tests.sh staging
+       
+   - name: Notify deployment status
+     uses: 8398a7/action-slack@v3
+     with:
+       status: ${{ job.status }}
+       channel: '#deployments'
+       webhook_url: ${{ secrets.SLACK_WEBHOOK }} 
