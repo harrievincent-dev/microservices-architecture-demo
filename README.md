@@ -1,4 +1,3 @@
-Complete microservices ecosystem with Spring Cloud, Docker, Kubernetes, and comprehensive monitoring
 # Microservices Architecture Demo
 
 ## 🚀 Enterprise-Grade Microservices Ecosystem
